@@ -1,6 +1,6 @@
 //
 // FX ST Blitter
-// Copyright (c) 2019 by Jorge Cwik
+// Copyright (c) 2019,2021 by Jorge Cwik
 //
 
 `timescale 1 ns / 1 ns
@@ -170,6 +170,13 @@ module stBlitter( input s_clks Clks, input ASn, RWn, LDSn, UDSn,
 		end
 	end		
 		
+	// Update force dest read logic if endmask changed.
+	reg maskChanged;
+	always_ff @(posedge Clks.clk) begin
+		if( Clks.enPhi1)
+			maskChanged <= wrWordSel & (SEL[REG_08] | SEL[REG_0A] | SEL[REG_0C]);
+	end
+	
 	//
 	// Misc user registers
 	//
@@ -281,7 +288,7 @@ module stBlitter( input s_clks Clks, input ASn, RWn, LDSn, UDSn,
 		.XC1, .XC2, .XYZ, .rBltReset, .Direction, .IncSign, .iDBUS, .oABUS);
 
 	bltScore bltScore( .Clks, .SEL, .iDBUS, .OP, .HOP, .destBuf, .srcbuf( skewed), 
-			.rBltReset, .updCycle, .updDst, .busOwned, .enIas, .XC1, .XC2, .wrWordSel,
+			.rBltReset, .updCycle, .updDst, .busOwned, .enIas, .XC1, .XC2, .wrWordSel, .maskChanged,
 			.lEndMask, .cEndMask, .rEndMask,			
 			.ramSel, .ramWrSel, .ramSelIdx( iABUS[4:1]), .ramIdx,
 			.ramOut,
@@ -626,7 +633,7 @@ endmodule
 
 // Blitter core operation
 module bltScore( input s_clks Clks, input [15:0] SEL, input [15:0] iDBUS,
-				input rBltReset, updCycle, updDst, busOwned, enIas, XC1, XC2, wrWordSel,
+				input rBltReset, updCycle, updDst, busOwned, enIas, XC1, XC2, wrWordSel, maskChanged,
 				
 				input ramSel, ramWrSel, input [3:0] ramSelIdx, input [3:0] ramIdx,
 				output logic [15:0] ramOut,
@@ -656,24 +663,52 @@ module bltScore( input s_clks Clks, input [15:0] SEL, input [15:0] iDBUS,
 	end
 	
 	// Force destination read according to relevant endmask
-	// Updated at the write cycle. Required before the actual cycle by the control machine state.
+	// Updated at the write cycle. Required before the actual blit cycle by the control machine state.
 	// So we predict the state at the previous write cycle.
-	// And at the middle of the write cycle because forceDestRd is pipelined
+	// And we do it at the middle of the write cycle because forceDestRd is pipelined
+	
+	// The endmask selection (right, center, or left) is performed at a specific single point.
+	// But the actual content of the selected endmask can be modified anytime.
+	//
+	// Original logic is almost fully asynchronous
+	
+	reg [1:0] nxtMask;			// Holds the selected endmask for next blit cycle
+
 	always_ff @(posedge Clks.clk) begin
-		if( Clks.pwrUp)			forceDestRd <= 1'b0;
-		else if( Clks.enPhi1 & rBltReset)
-			// For start of blit
+		if( Clks.pwrUp) begin
+			forceDestRd <= 1'b0;
+			nxtMask <= '0;
+		end
+		
+		else if( Clks.enPhi1 & maskChanged) begin
+			case( nxtMask)
+			2'b00:			forceDestRd <= !(& lEndMask);
+			2'b01:			forceDestRd <= !(& rEndMask);
+			2'b10:			forceDestRd <= !(& cEndMask);
+			endcase
+		end
+		else if( Clks.enPhi1 & rBltReset) begin
 			forceDestRd <= !(& lEndMask);
+			nxtMask <= 2'b00;
+		end
 		else if( updDst & enIas) begin
 			// This is the correct priority in case line lenght is one or two words!
 			
-			if( XC1)			forceDestRd <= !(& lEndMask);		// If last cycle on line, next is new line (use left endmask)
-			else if( XC2)		forceDestRd <= !(& rEndMask);		// If next cycle would be last on line, use right endmask
-			else				forceDestRd <= !(& cEndMask);		// Otherwise it would be center
+			if( XC1) begin
+				forceDestRd <= !(& lEndMask);		// If last cycle on line, next is new line (use left endmask)
+				nxtMask <= 2'b00;
+			end else if( XC2) begin
+				forceDestRd <= !(& rEndMask);		// If next cycle would be last on line, use right endmask
+				nxtMask <= 2'b01;
+			end
+			else begin
+				forceDestRd <= !(& cEndMask);		// Otherwise it would be center
+				nxtMask <= 2'b10;
+			end
 		end
 	end
 	
-	
+
 	//
 	// Halftone RAM
 	//
